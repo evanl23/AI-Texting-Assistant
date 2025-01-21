@@ -10,12 +10,12 @@ from threading import Thread
 app = Flask(__name__)
 
 # Twilio credentials
-TWILIO_SID = ""
-TWILIO_AUTH_TOKEN = ""
-TWILIO_PHONE_NUMBER = ""
+TWILIO_SID = os.getenv("TWILIO_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
 # OpenAI api key
-OPENAI_API_KEY = ""
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # Clients
 Tclient = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
