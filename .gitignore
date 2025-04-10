@@ -69,3 +69,9 @@ node_modules/
 .dataconnect
 
 .DS_Store
+
+# Testing files
+client.py
+time_experiment.py
+initial.py
+receiving_server.py
