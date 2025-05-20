@@ -748,12 +748,6 @@ def reminder_thread():
         )
         message_final = message.choices[0].message.content
 
-        # lol
-        jo = "jerk off"
-        j = "jerk"
-        if jo in task or j in task:
-            message_final += "\U0001F609 \U0001F609 \U0001F4A6 \U0001F4A6"
-
         user_ref = db.collection("Users").document(f"{number}").get()
         if user_ref.exists:
             # Append to threads
