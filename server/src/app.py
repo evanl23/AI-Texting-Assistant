@@ -1072,66 +1072,13 @@ def receive_message():
 def reminder_thread():
     now = datetime.now(pytz.UTC).replace(second=0, microsecond=0).isoformat()
     reminders = db.collection("Reminders").where(filter=FieldFilter("time", "==", now)).where(filter=FieldFilter("status", "==", "Pending")).stream()
-    for event in reminders:
-        # Convert to dictionary and get reminder task and user number
-        event_dict = event.to_dict()
-        task = event_dict.get("task")
-        number = event_dict.get("user_number")
-
-        # Create message through OpenAI api
-        message = Oclient.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "developer", 
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "Create a friendly reminder for the task the user enters. Keep it brief and keep the name of the reminder relatively the same. Do not say tell the user to set a reminder. Simply, remind them." 
-                        }
-                    ]
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"{task}"
-                        }
-                    ]
-                }
-            ],
-            temperature=0.35
-        )
-        message_final = message.choices[0].message.content
-
-        user_ref = db.collection("Users").document(f"{number}").get()
-        if user_ref.exists:
-            # Append to threads
-            user_dict = user_ref.to_dict()
-            Thread_id = user_dict.get("thread_ID")
-            message = Oclient.beta.threads.messages.create(
-                thread_id=Thread_id,
-                role="assistant",
-                content=message_final
-            )
-            # Add to twilio conversation
-            twilio_id = user_dict.get("twilio_ID")
-            message = Tclient.conversations.v1.conversations(
-                twilio_id
-            ).messages.create(
-                body=message_final
-            )
-        
-        # Set expired non-recurring reminder status to be completed 
-        if event_dict.get("recurring") == False:
-            db.collection("Reminders").document(event.id).update({"status": "Completed"})
-
-    # Update recurring reminders
-    update_recurring_reminders()
-
-    return jsonify({"Return message": "Place holder return message"})
-
+    
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = [executor.submit(handle_reminders, event) for event in reminders]
+    for f in futures:
+        f.result()
+    return jsonify({"Status": "Reminders sent"})
+                 
 # Endpoint for retiring old reminders
 @app.route("/delete_expired_reminders", methods=["POST"])
 def delete_past_reminder(): 
