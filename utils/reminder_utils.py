@@ -1,5 +1,3 @@
-import firebase_admin
-from firebase_admin import firestore, credentials
 import logging
 from google.cloud.firestore_v1.base_query import FieldFilter
 from rapidfuzz import fuzz 
@@ -9,27 +7,49 @@ from openai import OpenAI
 from twilio.rest import Client
 import os
 
-from app import standardize_time
-
-# Initialize firestore
-cred = credentials.Certificate("/mnt/secrets4/FIREBASE_ADMIN_AUTH")
-DB_app = firebase_admin.initialize_app(cred)
-db = firestore.client()
-
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Api keys
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-TWILIO_SID = os.getenv("TWILIO_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+_oclient = None
+_tclient = None
 
-# Clients
-Tclient = Client(TWILIO_SID, TWILIO_AUTH_TOKEN)
-Oclient = OpenAI(api_key=OPENAI_API_KEY)
+def get_openai_client():
+    """Initialize and return the OpenAI client"""
+    global _oclient
+    if _oclient is None:
+        # Api key
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        _oclient = OpenAI(api_key=openai_api_key)
+    return _oclient
 
-def add_reminder(user_number, task, date, time, timezone, recurring=False, frequency=None):
+def get_twilio_client():
+    """Initialize and return the Twilio client"""
+    global _tclient
+    if _tclient is None:
+        # Api keys
+        twilio_sid = os.getenv("TWILIO_SID")
+        twilio_auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        _tclient = Client(twilio_sid, twilio_auth_token)
+    return _tclient
+
+def standardize_time(date_str, time_str, user_timezone="US/Eastern"):
+    if not date_str: # Check if date is provided, if now, assume today
+        date_str = datetime.now(pytz.utc).strftime("%Y-%m-%d")
+
+    # Convert parsed strings to a datetime object
+    naive_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+
+    # Set the correct timezone
+    user_tz = pytz.timezone(user_timezone) # Adds a time zone to datetime object
+    localized_dt = user_tz.localize(naive_dt)
+
+    # Convert to UTC
+    utc_dt = localized_dt.astimezone(pytz.utc).isoformat()
+
+    return utc_dt  # Return datetime in UTC
+
+def add_reminder(user_number, db, task, date, time, timezone, recurring=False, frequency=None):
     reminder_ref = db.collection("Reminders").document()
     try:
         reminder_ref.set({
@@ -44,7 +64,7 @@ def add_reminder(user_number, task, date, time, timezone, recurring=False, frequ
     except Exception as e:
         logger.warning(f"Failed to set reminder: {e}")
 
-def delete_reminder(user_number, user_task, date=None, time=None): 
+def delete_reminder(user_number, db, user_task, date=None, time=None): 
     to_delete_ref = db.collection("Reminders")
     to_delete = to_delete_ref.where(filter=FieldFilter("recurring", "==", True)).where(filter=FieldFilter("user_number", "==", user_number)).stream()
     for event in to_delete:
@@ -53,7 +73,8 @@ def delete_reminder(user_number, user_task, date=None, time=None):
         if fuzz.ratio(task, user_task) > 50 or task.lower() in user_task.lower() or user_task.lower() in task.lower():
             to_delete_ref.document(event.id).update({"status": "Completed"})
 
-def get_reminders(user_number, timezone='US/Eastern'):
+def get_reminders(user_number, db, timezone='US/Eastern'):
+    
     now = datetime.now(pytz.UTC).replace(second=0, microsecond=0).isoformat() # Don't change. All times in database is utc
     reminders = db.collection("Reminders").where(filter=FieldFilter("user_number", "==", user_number)).where(filter=FieldFilter("time", ">=", now)).where(filter=FieldFilter("status", "==", "Pending")).order_by("time").stream()
 
@@ -75,13 +96,14 @@ def get_reminders(user_number, timezone='US/Eastern'):
         schedule.append((task, dt))
     return schedule
 
-def handle_reminders(event):
+def handle_reminders(event, db):
     # Convert to dictionary and get reminder task and user number
     event_dict = event.to_dict()
     task = event_dict.get("task")
     number = event_dict.get("user_number")
 
-    # Create message through OpenAI api
+    # Get OpenAI client and create message
+    Oclient = get_openai_client()
     message = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
@@ -113,6 +135,7 @@ def handle_reminders(event):
         # Append to threads
         user_dict = user_ref.to_dict()
         Thread_id = user_dict.get("thread_ID")
+        Oclient = get_openai_client()
         message = Oclient.beta.threads.messages.create(
             thread_id=Thread_id,
             role="assistant",
@@ -120,6 +143,7 @@ def handle_reminders(event):
         )
         # Add to twilio conversation
         twilio_id = user_dict.get("twilio_ID")
+        Tclient = get_twilio_client()
         message = Tclient.conversations.v1.conversations(
             twilio_id
         ).messages.create(
@@ -130,7 +154,7 @@ def handle_reminders(event):
     if event_dict.get("recurring") == False:
         db.collection("Reminders").document(event.id).update({"status": "Completed"})
 
-def update_recurring_reminders():
+def update_recurring_reminders(db):
     now = datetime.now(pytz.UTC).replace(second=0, microsecond=0).isoformat() # Don't change all times in database is utc
     # Get all reminders that are recurring and before now
     reminders = db.collection("Reminders").where(filter=FieldFilter("status", "==", "Pending")).where(filter=FieldFilter("recurring", "==", True)).where(filter=FieldFilter("time", "<", now)).stream() # Returns a stream of documents

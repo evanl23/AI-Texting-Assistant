@@ -12,9 +12,9 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from google_auth_oauthlib.flow import Flow 
 import os
 
-from parsing_utils import intent, parse_timezone, parse_set, parse_delete, parse_edit, parse_calendar
-from reminder_utils import get_reminders, handle_reminders, update_recurring_reminders
-from calendar_utils import list_calendar
+from utils.parsing_utils import intent, parse_timezone, parse_set, parse_delete, parse_edit, parse_calendar
+from utils.reminder_utils import get_reminders, handle_reminders, update_recurring_reminders
+from utils.calendar_utils import list_calendar
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -58,22 +58,6 @@ def append_threads(threadID, role, message):
         role=role,
         content=message
     )
-
-def standardize_time(date_str, time_str, user_timezone="US/Eastern"):
-    if not date_str: # Check if date is provided, if now, assume today
-        date_str = datetime.now(pytz.utc).strftime("%Y-%m-%d")
-
-    # Convert parsed strings to a datetime object
-    naive_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-
-    # Set the correct timezone
-    user_tz = pytz.timezone(user_timezone) # Adds a time zone to datetime object
-    localized_dt = user_tz.localize(naive_dt)
-
-    # Convert to UTC
-    utc_dt = localized_dt.astimezone(pytz.utc).isoformat()
-
-    return utc_dt  # Return datetime in UTC
 
 def credentials_to_dict(credentials): 
     """ Helper function for creating credentials JSON """
@@ -287,7 +271,7 @@ def receive_message():
 
         if i == 0 or i == 1 or i == 2: # Set, delete, or edit cases
             # Parse information based on intent
-            p = parse_array[i](from_number, user_message, Timezone)
+            p = parse_array[i](from_number, user_message, Timezone, db)
             message = p.get("message")
             if message == None:
                 # Create a response message to send back to the user
@@ -323,7 +307,7 @@ def receive_message():
             append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
         elif i == 3: # Listing reminder case
             # Find all future reminders
-            p = get_reminders(from_number, Timezone)
+            p = get_reminders(from_number, db, Timezone)
             message_final = convert_list_to_text(p,0)
             while status == "in_progress": # Loops until status is no longer in_progress
                 status = _run.status
@@ -331,8 +315,11 @@ def receive_message():
             append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
         elif i == 4: # Set timezone case
             timezone = parse_timezone(user_message)
-            user_ref.update({"timezone": timezone})
-            message_final = "Noted!"
+            if timezone == None:
+                message_final = "Which timezone would you like to change to?"
+            else:
+                user_ref.update({"timezone": timezone})
+                message_final = "Noted!"
             while status == "in_progress": # Loops until status is no longer in_progress
                 status = _run.status
             append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
@@ -435,7 +422,7 @@ def reminder_thread():
     reminders = db.collection("Reminders").where(filter=FieldFilter("time", "==", now)).where(filter=FieldFilter("status", "==", "Pending")).stream()
     
     with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(handle_reminders, event) for event in reminders]
+        futures = [executor.submit(handle_reminders, event, db) for event in reminders]
     for f in futures:
         f.result()
     return jsonify({"Status": "Reminders sent"})
@@ -459,7 +446,7 @@ def delete_past_reminder():
 @app.route("/update_recurring", methods=["POST"])
 def update_recurring():
     # Update recurring reminders
-    update_recurring_reminders()
+    update_recurring_reminders(db)
     return {"Status": "Recurring reminders updated"}
 
 # Endpoint for authorizing user with Googe
@@ -474,7 +461,7 @@ def authorize_access():
         session["phone_number"] = phone_number
     flow = Flow.from_client_secrets_file("/mnt/secrets5/gcal_credentials", scopes=SCOPES) # Start authorization process
     flow.redirect_uri = "https://textmarley-one-21309214523.us-central1.run.app/oauth2callback" # Redirect user to this link
-    auth_url, state = flow.authorization_url(include_granted_scopes='true')
+    auth_url, state = flow.authorization_url(include_granted_scopes='true', access_type='offline')
     session["state"] = state # Store current state in session
     return redirect(auth_url)
 
@@ -500,6 +487,10 @@ def oauth2callback():
         user_ref.update({"calendar_token.token": credentials.token})
         return "<p>You already have a Google Calendar connected! You may exit this window."
     else: 
+        # user_ref.set({
+        #     "calendarConnected": True
+        # }, merge=True)
+        
         user_ref.set({
             "calendar_token": credentials_to_dict(credentials) # Store calendar credentials with user
         }, merge=True)

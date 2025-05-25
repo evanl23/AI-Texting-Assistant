@@ -1,17 +1,35 @@
-from openai import OpenAI
 from datetime import datetime
 import pytz
 import json
-import os
+import logging
 
-from reminder_utils import add_reminder, delete_reminder, get_reminders
-from calendar_utils import add_to_calendar
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Set up OpenAI
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-Oclient = OpenAI(api_key=OPENAI_API_KEY)
+# Forward declarations to avoid circular imports
+# These will be imported when needed
+_reminder_utils = None
+_calendar_utils = None
+_get_openai_client = None
+
+def _lazy_import():
+    """Lazy import dependencies to avoid circular imports"""
+    global _reminder_utils, _calendar_utils, _get_openai_client
+    if _reminder_utils is None:
+        from utils import reminder_utils as ru
+        from utils import calendar_utils as cu
+        _reminder_utils = ru
+        _calendar_utils = cu
+        _get_openai_client = ru.get_openai_client
 
 def intent(user_message):
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     # Parse for user intent
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
@@ -53,7 +71,13 @@ def intent(user_message):
 
     return int(parsed_response)
 
-def parse_set(user_number, user_message, timezone): 
+def parse_set(user_number, user_message, timezone, db): 
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages= [
@@ -166,10 +190,16 @@ def parse_set(user_number, user_message, timezone):
             frequency = None
 
         if task and time:
-            add_reminder(user_number, task, date, time, timezone, recurring, frequency)
+            _reminder_utils.add_reminder(user_number, db, task, date, time, timezone, recurring, frequency)
         return {"task": task, "time": time}
 
-def parse_delete(user_number, user_message, timezone):
+def parse_delete(user_number, user_message, timezone, db):
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages= [
@@ -222,10 +252,16 @@ def parse_delete(user_number, user_message, timezone):
         task = parsed_data.get("task")
         date = parsed_data.get("date", None)
         time = parsed_data.get("time", None)
-        delete_reminder(user_number, task, date, time)
+        _reminder_utils.delete_reminder(user_number, db, task, date, time)
         return {"task": task}
 
-def parse_edit(user_number, user_message, timezone):
+def parse_edit(user_number, user_message, timezone, db):
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages= [
@@ -259,11 +295,17 @@ def parse_edit(user_number, user_message, timezone):
     time_new = parsed_data.get("new time")
 
     if task_original and date_new and time_new:
-        delete_reminder(user_number, task_original)
-        add_reminder(user_number, task_original, date_new, time_new)
+        _reminder_utils.delete_reminder(user_number, task_original)
+        _reminder_utils.add_reminder(user_number, task_original, date_new, time_new)
     return {"Original task": task_original, "New Date": date_new, "New time": time_new}
 
 def parse_timezone(user_message):
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages= [
@@ -300,11 +342,20 @@ def parse_timezone(user_message):
         ],
         temperature=1
     )
-    parsed_response = parsing_response.choices[0].message.tool_calls[0].function.arguments
-    parsed_data = json.loads(parsed_response)
-    return parsed_data.get("timezone")
+    try: 
+        parsed_response = parsing_response.choices[0].message.tool_calls[0].function.arguments
+        parsed_data = json.loads(parsed_response)
+        return parsed_data.get("timezone")
+    except Exception as e:
+        return None
 
 def parse_calendar(user_message, timezone, credentials):
+    # Lazy import dependencies
+    _lazy_import()
+    
+    # Get OpenAI client
+    Oclient = _get_openai_client()
+    
     parsing_response = Oclient.chat.completions.create(
         model="gpt-4o-mini",
         messages= [
@@ -431,8 +482,9 @@ def parse_calendar(user_message, timezone, credentials):
                 BYDAY = parsed_frequency.get("BYDAY")
                 comma = ","
                 joined = comma.join(BYDAY)
-                add_to_calendar(credentials, event, date, start_time, timezone, duration, end_time, FREQ, joined, INTERVAL)
+                _calendar_utils.add_to_calendar(credentials, event, date, start_time, timezone, duration, end_time, FREQ, joined, INTERVAL)
                 return {"Event": event, "Time": start_time, "Duration": duration, "FREQ": FREQ}
 
-        add_to_calendar(credentials, event, date, start_time, timezone, duration, end_time )
+        _calendar_utils.add_to_calendar(credentials, event, date, start_time, timezone, duration, end_time )
         return {"Event": event, "Time": start_time, "Duration": duration}
+
