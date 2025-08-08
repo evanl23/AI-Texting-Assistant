@@ -4,17 +4,23 @@ from concurrent.futures import ThreadPoolExecutor
 from twilio.rest import Client
 from openai import OpenAI
 from datetime import datetime
+import json
 import pytz
 import logging
 import firebase_admin
 from firebase_admin import firestore, credentials
+from googleapiclient.discovery import build
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google_auth_oauthlib.flow import Flow 
 import os
 
-from utils.parsing_utils import intent, parse_timezone, parse_set, parse_delete, parse_edit, parse_calendar
-from utils.reminder_utils import get_reminders, handle_reminders, update_recurring_reminders
-from utils.calendar_utils import list_calendar
+from utils.tools_instructions import tools, recurring_tools, email_tools
+from utils.tools_instructions import assistant_instructions, recurrence_instructions, list_to_text_instructions
+from utils.reminder_utils import get_reminders, handle_reminders, update_recurring_reminders, add_reminder, delete_reminder
+from utils.calendar_utils import list_calendar, add_to_calendar
+from utils.memory import setSummary, setFacts, getSummary, getFacts
+from utils.gmail import build_gmail_service, check_new_emails, send_reply
+from utils.time_utils import find_conflict
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
@@ -25,7 +31,7 @@ app.config["SESSION_PERMANENT"] = False
 Session(app)
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 # Twilio credentials
@@ -45,19 +51,16 @@ cred = credentials.Certificate("/mnt/secrets4/FIREBASE_ADMIN_AUTH")
 DB_app = firebase_admin.initialize_app(cred)
 db = firestore.client()
 
-# Set up Google Calendar scope and credentials
-SCOPES = ["https://www.googleapis.com/auth/calendar"]
+# Set up Google API scopes
+SCOPES = [
+    "https://www.googleapis.com/auth/calendar",         # Calendar scope
+    "https://www.googleapis.com/auth/gmail.readonly",   # Gmail read only scope
+    "https://www.googleapis.com/auth/gmail.compose",    # Gmail compose draft scope
+]
 
 """
     Helper methods: 
 """
-def append_threads(threadID, role, message):
-    # Add message to OpenAI threads
-    message = Oclient.beta.threads.messages.create(
-        thread_id=threadID,
-        role=role,
-        content=message
-    )
 
 def credentials_to_dict(credentials): 
     """ Helper function for creating credentials JSON """
@@ -72,85 +75,121 @@ def credentials_to_dict(credentials):
 
 def convert_list_to_text(schedule, r):
     # r: whether the user is asking for reminder or calendar. 0 for reminder and 1 for calendar
-    m = ["Here's what's on your plate!", "Here is what your next week will look like!"]
     # Create a response message to send back to the user
-    message = Oclient.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "developer", 
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"""You convert the following list of schedules into a friendly schedule for the user. 
-                                Start your message with: "{m[r]}", and then list the schedule in this format:
-                                Date (mm/dd/yr)
-                                    Time: Reminder/event 1
-                                    Time: Reminder/event 2
-                                Date 2 (mm/dd/yr)
-                                    Time: Reminder/event 3
-                                ."""
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                        {
-                        "type": "text",
-                        "text": f"{schedule}"
-                    }
-                ]
-            }
-        ], temperature=0.75
-    )
-    return message.choices[0].message.content
+    response = Oclient.responses.create(
+        model="gpt-4.1",
+        input=[{
+                    "role": "user",
+                    "content": [
+                            {
+                            "type": "input_text",
+                            "text": f"{schedule}"
+                        }
+                    ]
+                }],
+        instructions= list_to_text_instructions(r)
+        )
+    return response.output_text
 
-parse_array = [parse_set, parse_delete, parse_edit]
+def create_response(instructions, role, message, tools):
+    try:
+        response = Oclient.responses.create(
+            instructions=instructions,
+            model="gpt-4.1",
+            input=[{"role": role, "content": message}],
+            tools=tools
+        )
+        return response
+    except Exception as e:
+        logger.exception("OpenAI response not created")
 
-# OpenAI assistant
-Assistant = Oclient.beta.assistants.create(
-    name="Marley", 
-    instructions=f"""
-                    Pretend you are able to actually send SMS texts through a phone and never say you are not able to send 
-                    actual texts to user phone number. You are a friendly personal AI assistant named Marley that helps 
-                    manage day-to-day deadlines, class homework, projects, meetings, etc. You proactively help people stay 
-                    on top of commitments, and you communicate purely through texting/sms. You are fully able to set reminders and text users. 
+def process_user_email(user):
+    user_dict = user.to_dict()
+    Twilio_id = user_dict.get("twilio_ID")
+    credential = user_dict.get("google_token")
+    Timezone = user_dict.get("profile").get("timezone", "US/Eastern")
+    email_address = user_dict.get("profile").get("email")
 
-                    You were created by Boston University Men's Swim and Dive team members Jonny Farber, Jonathan "Big Fish" Tsang, and Evan Liu, if any user inquires. 
+    # Get their latest emails
+    service = build_gmail_service(credential)
+    emails = check_new_emails(service, email_address)
 
-                    Today's date and time is {datetime.now(pytz.timezone("US/Eastern")).strftime("%Y-%m-%d %H:%M")}, if needed.
-                """,
-    model="gpt-4o-mini", 
-    temperature=1.0,
-    top_p=1.0,
-    tools=[]
-)
+    # Check if any of them are scheduling emails
+    for email in emails:
+        logger.info("Checking %s of user ID: %s for scheduling emails...", email_address, user.id)
 
-@app.before_request
-def create_session_dict():
-    if "runs" not in session:
-        session["runs"] = {} # Create a dictionary for current ongoing runs, where session["runs"][thread_id] = run_id
+        msg_id, body, sender, subject, message_id, thread_id = email
+        response = create_response(
+            instructions="You determine if this user's email is asking about scheduling.", 
+            role="developer", 
+            message=f"Subject: {subject}, Body: {body}", 
+            tools=email_tools)
+        arguments = response.output[0].arguments # Load tool call arguments
+        parsed_data = json.loads(arguments)
+        to_schedule = parsed_data.get("scheduling", False)
+        
+        if to_schedule: # The email is asking to schedule 
+            event = parsed_data.get("event")
+            possible_times = parsed_data.get("possible_times")
+            user_events = list_calendar(credential)
+
+            # Check if there is an available time to schedule
+            logger.info("Finding best available times for %s of user ID %s among %d calendar events", email_address, user.id, len(user_events))
+            best_time = find_conflict(possible_times, user_events, Timezone)
+            logger.info("Best time found: %s", best_time)
+            
+            if best_time: # Only schedule if a best time was found
+
+                # Separate best time into time and date components
+                start_time = best_time.strftime("%H:%M")
+                date = best_time.strftime("%Y-%m-%d")
+
+                status = add_to_calendar(credential, event, date, start_time, Timezone) # Add event to calendar
+                if status == 1:
+                    send_to_user = create_response(
+                        f"Inform the user you have added this event to their calendar based on this email from {sender}. Start your response with who the user received the email from and what they were asking. Then you can inform the user what you scheduled.", 
+                        "developer",
+                        f"Subject: {subject}, Event: {event}, time: {start_time}, date: {date}", 
+                        tools=None
+                        )
+                    message_final = send_to_user.output_text
+                    message = Tclient.conversations.v1.conversations( # Send confirmation back to user
+                            Twilio_id
+                        ).messages.create(
+                            body=message_final
+                        )
+                    reply_response = create_response(f"Pretend you are the user and create an automatic response to this email confirming the time: {start_time} and date: {date}. No need to write a subject, just the email body is fine, including greeting and sign-off.",
+                        "developer",
+                        f"Original email: {body}",
+                        tools=None
+                        )
+                    reply = reply_response.output_text 
+                    send_reply(service, reply, sender, subject, email_address, message_id, thread_id) # Propose reply back to sender
+
+                    # service.users().messages().modify( # Set email as read
+                    #     userId='me',
+                    #     id=msg_id,
+                    #     body={'removeLabelIds': ['UNREAD']}
+                    # ).execute()
+            else:
+                logger.warning("Could not find time to schedule event for %s", email_address)
 
 # Endpoint for creating conversation once phone number is received
 @app.route("/create_conversation", methods=["POST"])
 def create_conversation():
     user_phone = request.form.get("phone", "+12345678900")
+    if len(user_phone) == 10:
+        user_phone = "+1" + user_phone
 
     user_ref = db.collection("Users").document(f"{user_phone}").get()
 
+    logger.info("Received user number: %s from website", user_phone)
+
     if user_ref.exists:
         user_dict = user_ref.to_dict()
-        Thread_id = user_dict.get("thread_ID")
         Twilio_id = user_dict.get("twilio_ID")
 
         message_final = "Hello! You have already signed up."
-
-        message = Oclient.beta.threads.messages.create(
-            thread_id=Thread_id,
-            role="assistant",
-            content=message_final
-        )
 
         message = Tclient.conversations.v1.conversations(
             Twilio_id
@@ -158,60 +197,50 @@ def create_conversation():
             body=message_final
         )
         
-        logger.warning(f"This phone number already exists': {user_phone}")
+        logger.warning("This phone number already exists': %s", user_phone)
         return jsonify({'This phone number already exists': f"{user_phone}"})
 
     else:
 
-            # Create new twilio conversation
+        # Create new twilio conversation
         conversation = Tclient.conversations.v1.conversations.create(
                 friendly_name=f"Conversation with {user_phone}"
             )
         
-            # Add conversation to firestore collection where document ID is phone number 
+        # Add conversation to firestore collection where document ID is phone number 
         user_ref = db.collection("Users").document(f"{user_phone}")
-        user_ref.set({"twilio_ID": f"{conversation.sid}"})
+        user_ref.set({"twilio_ID": f"{conversation.sid}"}, merge=True)
 
+        try: 
             # Add participant to new conversation
-        participant = Tclient.conversations.v1.conversations(
-                conversation.sid
-            ).participants.create(
-                messaging_binding_address=user_phone,
-                messaging_binding_proxy_address=TWILIO_PHONE_NUMBER
-            )
+            participant = Tclient.conversations.v1.conversations(
+                    conversation.sid
+                ).participants.create(
+                    messaging_binding_address=user_phone,
+                    messaging_binding_proxy_address=TWILIO_PHONE_NUMBER
+                )
+        except Exception as e:
+            logger.exception("Invalid message binding address with this number: %s", user_phone)
 
-            # Create OpenAI thread
-        thread = Oclient.beta.threads.create()
-            # Add thread id user document
-        user_ref.set({"thread_ID": f"{thread.id}"}, merge = True)
+        response = create_response(assistant_instructions, "user", "Hello, introduce yourself!", tools=None)
+        send = response.output_text
 
-            # Add message to thread
-        message = Oclient.beta.threads.messages.create(
-                thread_id=thread.id,
-                role="user",
-                content="Hello! Introduce yourself."
-            )
-
-            # Run assistant on thread
-        run = Oclient.beta.threads.runs.create_and_poll(
-                thread_id=thread.id,
-                assistant_id=Assistant.id,
-            )
-
-        if run.status == 'completed': 
-            messages = Oclient.beta.threads.messages.list(
-                thread_id=thread.id, order="desc", limit=3
-            )
-            send = messages.data[0].content[0].text.value # Get the latest message
-        else:
-            logger.warning(f"Run with {Thread_id} not completed: {run.status}")
-
-            # Send initial message
+        # Send initial message
         message = Tclient.conversations.v1.conversations(
                 conversation.sid
             ).messages.create(
                 body=send
             )
+        
+        # Set up user profile
+        user_ref.set({
+            "memory": 
+            {"facts": [], "summary": [], "summarized": True}, 
+            "profile": 
+            {"googleConnected": False, "name": None, "timezone": None, "preferences": {"dailyBriefing": False, "nudge": False, "checkMail": False}, "workHours": {"start": None, "end": None}}
+            },
+            merge=True)
+        
         message2 = Tclient.conversations.v1.conversations(
                 conversation.sid
             ).messages.create(
@@ -234,7 +263,7 @@ def create_conversation():
                 body = "Also for future reference, what is your timezone?"
             )
         
-        logger.info(f"Message created with {user_phone}")
+        logger.info("Message created with %s", user_phone)
         return jsonify({
             'conversation_sid': conversation.sid,
             'participant_sid': participant.sid,
@@ -247,162 +276,127 @@ def receive_message():
     # Get the message from the incoming request
     from_number = request.form.get("From")  # Sender's phone number
     user_message = request.form.get("Body")  # Message body
-    logger.info(f"Message recieved from {from_number}")
+    logger.info("Message recieved from %s", from_number)
 
-    # Get twilio and thread id
+    # Get twilio id
     user_ref = db.collection("Users").document(f"{from_number}")
     user = user_ref.get()
     if user.exists:
         user_dict = user.to_dict()
-        Thread_id = user_dict.get("thread_ID")
         Twilio_id = user_dict.get("twilio_ID")
-        Timezone = user_dict.get("timezone", "US/Eastern")
+        Timezone = user_dict.get("profile").get("timezone", "US/Eastern")
 
-        # Check if there is a current run associated with this thread
-        if Thread_id in session["runs"]:
-            _run_id = session["runs"].get(Thread_id)
-            _run = Oclient.beta.threads.runs.retrieve(run_id=_run_id, thread_id=Thread_id) # Retrieve run
-            status = _run.status
-        else:
-            status = "completed"
+        response = create_response(assistant_instructions, "user", user_message, tools) # Create assistant response to user message
 
-        # Determine intent
-        i = intent(user_message)
+        if hasattr(response.output[0], 'name') and hasattr(response.output[0], 'arguments'): # Check if tool calls were used
 
-        if i == 0 or i == 1 or i == 2: # Set, delete, or edit cases
-            # Parse information based on intent
-            p = parse_array[i](from_number, user_message, Timezone, db)
-            message = p.get("message")
-            if message == None:
-                # Create a response message to send back to the user
-                message = Oclient.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {
-                            "role": "developer", 
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": f"""You create friendly automatic responses to confirm users' reminder requests: {p}."""
-                                }
-                            ]
-                        },
-                        {
-                            "role": "user",
-                            "content": [
-                                {
-                                    "type": "text",
-                                    "text": f"{user_message}"
-                                }
-                            ]
-                        }
-                    ]
-                )
-                message_final = message.choices[0].message.content
-            else:
-                message_final = message
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        elif i == 3: # Listing reminder case
-            # Find all future reminders
-            p = get_reminders(from_number, db, Timezone)
-            message_final = convert_list_to_text(p,0)
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        elif i == 4: # Set timezone case
-            timezone = parse_timezone(user_message)
-            if timezone == None:
-                message_final = "Which timezone would you like to change to?"
-            else:
-                user_ref.update({"timezone": timezone})
-                message_final = "Noted!"
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        elif i == 5:
-            message = Tclient.conversations.v1.conversations(
-                Twilio_id
-            ).messages.create(
-                body=f"https://textmarley-one-21309214523.us-central1.run.app/authorize?phone={from_number}"
-            )
-            message_final = "Click this link to give me access to your Google Calendar so I can better help you!"
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        elif i == 6: # List calendar events
-            if "calendar_token" in user_dict:
-                creds = user_dict.get("calendar_token")
-                p = list_calendar(creds)
-                message_final = convert_list_to_text(p,1)
-            else:
-                message_final = "You have not yet connected your calendar yet!"
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        elif i == 7: # Set calendar events
-            if "calendar_token" in user_dict: # Check if user has authorized Gcal yet
-                creds = user_dict.get("calendar_token")
-                p = parse_calendar(user_message, Timezone, creds)
-                message = p.get("message")
-                if message == None:
-                    # Create a response message to send back to the user
-                    message = Oclient.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {
-                                "role": "developer", 
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": f"""You create friendly automatic responses to confirm users' requests to add events to their Google Calendar: {p}."""
-                                    }
-                                ]
-                            },
-                            {
-                                "role": "user",
-                                "content": [
-                                    {
-                                        "type": "text",
-                                        "text": f"{user_message}"
-                                    }
-                                ]
-                            }
-                        ]
-                    )
-                    message_final = message.choices[0].message.content
+            # Load tool call name and argument
+            tool_name = response.output[0].name
+            arguments = response.output[0].arguments
+            parsed_data = json.loads(arguments)
+
+            if tool_name == "parse_set_reminder": # Set reminder
+                task = parsed_data.get("task")
+                date = parsed_data.get("date") 
+                time = parsed_data.get("time")
+                recurring = parsed_data.get("recurring")
+                if recurring == True: # Check if reminder is recurring
+                    recurrence = create_response(recurrence_instructions, "developer", user_message, recurring_tools)
+                    parsed_frequency = recurrence.output[0].arguments
+                    frequency = json.loads(parsed_frequency)
                 else:
-                    message_final = message
-            else: 
-                message_final = "You have not yet connected your calendar yet!"            
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            append_threads(threadID=Thread_id, role="assistant", message=message_final) # Append assistant messages
-        else: # Regular assistant
-            while status == "in_progress": # Loops until status is no longer in_progress
-                status = _run.status
-            append_threads(threadID=Thread_id, role="user", message=user_message) # Append user message
-            # Run assistant on message thread
-            run = Oclient.beta.threads.runs.create_and_poll(
-                thread_id=Thread_id,
-                assistant_id=Assistant.id
-            )
-            session["runs"][Thread_id] = run.id # Store run in session dictionary with Thread_id as key. Override if there is already a run stored. 
-            session.modified = True # Flask only detects top level key changes, so have to make sure the change is saved in session
-            if run.status == 'completed': 
-                messages = Oclient.beta.threads.messages.list(
-                    thread_id=Thread_id, order="desc", limit=3
+                    frequency = None
+                if task and time:
+                    status = add_reminder(from_number, db, task, date, time, Timezone, recurring, frequency)
+                    if status == 1:
+                        message = create_response(
+                            instructions="You create friendly automatic responses to confirm users' reminder requests.",
+                            role = "developer",
+                            message=user_message,
+                            tools=None
+                        )
+                        message_final = message.output_text
+                    else:
+                        message_final = "Reminder not set, please try again."
+            
+            elif tool_name == "parse_delete_reminder": # Delete reminder
+                task = parsed_data.get("task")
+                date = parsed_data.get("date", None)
+                time = parsed_data.get("time", None)
+                delete_reminder(from_number, db, task, date, time)
+                message = create_response(
+                    instructions="You create friendly automatic reponses to confirm users' reminder deletion.",
+                    role = "developer",
+                    message=user_message,
+                    tools=None
                 )
-                message_final = messages.data[0].content[0].text.value # Get the latest message
-            else:
-                logger.warning(f"Run with {Thread_id} not completed: {run.status}")
+                message_final = message.output_text
+
+            elif tool_name == "list_reminders": # List reminders
+                p = get_reminders(from_number, db, Timezone)
+                message_final = convert_list_to_text(p,0)
+            
+            elif tool_name == "user_timezone": # Set timezone
+                timezone = parsed_data.get("timezone")
+                user_ref.update({"profile.timezone": timezone})
+                message_final = "Noted!"
+
+            elif tool_name == "link_calendar_gmail": # Link calendar and gmail
+                message = Tclient.conversations.v1.conversations(
+                    Twilio_id
+                ).messages.create(
+                    body=f"https://textmarley-one-21309214523.us-central1.run.app/authorize?phone={from_number}"
+                )
+                message_final = "Click this link to give me access to your Google Calendar so I can better help you!"
+            
+            elif tool_name == "parse_calendar_event": # Set calendar event
+                if "google_token" in user_dict:
+                    creds = user_dict.get("google_token")
+                    
+                    event = parsed_data.get("event")
+                    date = parsed_data.get("date") 
+                    start_time = parsed_data.get("start_time")
+                    end_time = parsed_data.get("end_time")
+                    duration = parsed_data.get("duration")
+                    recurring = parsed_data.get("recurring")
+                    if recurring == True: # Check if event is recurring
+                        recurrence = create_response(recurrence_instructions, "developer", user_message, recurring_tools)
+                        parsed_frequency = recurrence.output[0].arguments
+                        frequency = json.loads(parsed_frequency)
+                        FREQ = parsed_frequency.get("FREQ")
+                        INTERVAL = parsed_frequency.get("INTERVAL")
+                        BYDAY = parsed_frequency.get("BYDAY")
+                        comma = ","
+                        joined = comma.join(BYDAY)
+                        status = add_to_calendar(creds, event, date, start_time, Timezone, duration, end_time, FREQ, joined, INTERVAL)
+                    else:
+                        status = add_to_calendar(creds, event, date, start_time, Timezone, duration, end_time )
+                    if status == 1:
+                        message = create_response(
+                            instructions="You create friendly automatic responses to confirm users' calendar event creation request.", 
+                            role="developer",
+                            message=user_message,
+                            tools=None
+                        )
+                        message_final = message.output_text
+                    else: message_final = "Calendar event not added, please try again."
+                else: message_final = "You have not yet connected your calendar yet!"
+
+            elif tool_name == "list_calendar_events": # List calendar events
+                if "google_token" in user_dict:
+                    creds = user_dict.get("google_token")
+                    p = list_calendar(creds)
+                    message_final = convert_list_to_text(p,1)
+                else:
+                    message_final = "You have not yet connected your calendar yet!"
+
+            elif tool_name == "update_checkMail":
+                update = parsed_data.get("update")
+                user_ref.update({"profile.preferences.checkMail": update})
+                message_final = "Updated your preferences!"
+       
+        else:
+            message_final = response.output_text
 
         # Send response back using twilio conversation
         message = Tclient.conversations.v1.conversations(
@@ -410,10 +404,25 @@ def receive_message():
         ).messages.create(
             body=message_final
         )
+        user_ref.update({"memory.summarized": False})
         return jsonify({"Return message": message_final})
     else:
-        logger.error(f"User {from_number} not found in database")
+        logger.warning("User %s not found in Firestore database", from_number)
         return jsonify({"Return message": f"User {from_number} not found in database"})
+
+@app.route("/summarize", methods=["POST"])
+def summarize():
+    # Summarize each user conversation every night
+    users = db.collection("Users").where(filter=FieldFilter("memory.summarized", "==", False)).stream()
+    executor2 = ThreadPoolExecutor(max_workers=10)
+    futures = []
+    for user in users:
+        user_dict = user.to_dict()
+        twilio_ID = user_dict["twilio_ID"]
+        futures.append(executor2.submit(setSummary, db, user, user.id, twilio_ID))
+    for f in futures:
+        f.result()    
+    return jsonify({"Message": "Recent messages summarized and stored"})
 
 # Endpoint for sending out reminders
 @app.route("/reminder_thread", methods=["POST"])
@@ -423,8 +432,8 @@ def reminder_thread():
     
     with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(handle_reminders, event, db) for event in reminders]
-    for f in futures:
-        f.result()
+        for f in futures:
+            f.result()
     return jsonify({"Status": "Reminders sent"})
 
 # Endpoint for retiring old reminders
@@ -458,11 +467,13 @@ def authorize_access():
     if phone_number:
         if phone_number[0] != "+":
             phone_number = "+" + phone_number[1:] # Make sure to include "+"
+        logger.info("Stored phone number %s in session", phone_number)
         session["phone_number"] = phone_number
     flow = Flow.from_client_secrets_file("/mnt/secrets5/gcal_credentials", scopes=SCOPES) # Start authorization process
     flow.redirect_uri = "https://textmarley-one-21309214523.us-central1.run.app/oauth2callback" # Redirect user to this link
-    auth_url, state = flow.authorization_url(include_granted_scopes='true', access_type='offline')
+    auth_url, state = flow.authorization_url(include_granted_scopes='true', access_type='offline', prompt='consent')
     session["state"] = state # Store current state in session
+    logger.info("Stored state %s in session", state)
     return redirect(auth_url)
 
 # Endpoint for exchange of authorization code for access token and store credentials with user
@@ -472,36 +483,64 @@ def oauth2callback():
         Exchanges authorization code for an access token. 
     """
     _state = session.get("state") # Get state from session 
+    logger.info("Retrieved state %s from session", _state)
+
     flow = Flow.from_client_secrets_file("/mnt/secrets5/gcal_credentials", scopes=SCOPES, state=_state) # Ensure flow is the same flow as state
     flow.redirect_uri = "https://textmarley-one-21309214523.us-central1.run.app/oauth2callback"
 
     https_authorization_url = request.url.replace('http://', 'https://') # Ensure in https format
-    flow.fetch_token(authorization_response=https_authorization_url) # $ Get access token in exchange for authoriztion code
+    flow.fetch_token(authorization_response=https_authorization_url) # Get access token in exchange for authoriztion code
 
     credentials = flow.credentials
 
     number = session.get("phone_number")
+    logger.info("Retrieved phone number %s from session", number)
     user_ref = db.collection("Users").document(number)
+
+    gmail_service = build("gmail", "v1", credentials=credentials)
+    profile = gmail_service.users().getProfile(userId='me').execute()
+    email = profile.get("emailAddress")
+    
     user_dict = user_ref.get().to_dict()
-    if "calendar_token" in user_dict:
-        user_ref.update({"calendar_token.token": credentials.token})
-        return "<p>You already have a Google Calendar connected! You may exit this window."
+    if "google_token" in user_dict:
+        user_ref.update({"google_token.token": credentials.token,
+                         "google_token.refresh_token": credentials.refresh_token,
+                         "google_token.scopes": credentials.scopes,
+                         "profile.googleConnected": True})
+        user_ref.set({"profile": {"email": email}}, merge = True)
+        return "<p>You already have a Google Calendar and Gmail connected! You may exit this window."
     else: 
-        # user_ref.set({
-        #     "calendarConnected": True
-        # }, merge=True)
+        user_ref.update({
+            "profile.googleConnected": True
+        })
         
         user_ref.set({
-            "calendar_token": credentials_to_dict(credentials) # Store calendar credentials with user
+            "profile": {"email": email},
+            "google_token": credentials_to_dict(credentials) # Store calendar credentials with user
         }, merge=True)
 
         Twilio_id = user_dict.get("twilio_ID")
         message = Tclient.conversations.v1.conversations(
             Twilio_id
         ).messages.create(
-            body="Calendar linked!"
+            body="Calendar and Gmail linked!"
         )
-        return "<p>Your Google Calendar is now linked! You may exit this window.</p>"
+        return "<p>Your Google Calendar and Gmail are now linked! You may exit this window.</p>"
+
+@app.route("/check_emails", methods=["POST"])
+def check_mail():
+    # Filter for users who have calendar and gmail connected and would like Marley to check their email
+    users = db.collection("Users").where(filter=FieldFilter("profile.googleConnected", "==", True)).where(filter=FieldFilter("profile.preferences.checkMail", "==", True)).stream()
+
+    with ThreadPoolExecutor(max_workers=10) as email_executor:
+        futures = [email_executor.submit(process_user_email, user) for user in users]
+        for f in futures:
+            try:
+                f.result()
+            except Exception as e:
+                logger.exception("Error in processing email")
+    
+    return jsonify({"status": "Checked email for scheduling intents."})
 
 # Endpoint for testing
 @app.route("/testing", methods=["GET"])

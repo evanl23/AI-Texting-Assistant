@@ -1,6 +1,9 @@
 from datetime import datetime, timedelta
 import pytz
 import logging
+from typing import List, Tuple
+
+from . import time_utils
 
 # These imports are potentially heavy, so we'll import them only when needed
 # to avoid slow startup times and circular import issues
@@ -8,7 +11,7 @@ _credentials_class = None
 _build_function = None
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 def _get_google_deps():
@@ -21,23 +24,7 @@ def _get_google_deps():
         _build_function = build
     return _credentials_class, _build_function
 
-def standardize_time(date_str, time_str, user_timezone="US/Eastern"):
-    if not date_str: # Check if date is provided, if now, assume today
-        date_str = datetime.now(pytz.utc).strftime("%Y-%m-%d")
-
-    # Convert parsed strings to a datetime object
-    naive_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-
-    # Set the correct timezone
-    user_tz = pytz.timezone(user_timezone) # Adds a time zone to datetime object
-    localized_dt = user_tz.localize(naive_dt)
-
-    # Convert to UTC
-    utc_dt = localized_dt.astimezone(pytz.utc).isoformat()
-
-    return utc_dt  # Return datetime in UTC
-
-def list_calendar(creds, day=7):
+def list_calendar(creds, day=7) -> List[Tuple[str, str, str]]:
     """List upcoming calendar events"""
     try:
         # Get dependencies
@@ -52,7 +39,7 @@ def list_calendar(creds, day=7):
                 calendarId="primary",
                 timeMin=now,
                 maxResults=day,
-                singleEvents=False,
+                singleEvents=True,
                 orderBy="startTime",
             ).execute()
         )
@@ -60,13 +47,15 @@ def list_calendar(creds, day=7):
         schedule = []
         for event in events:
             start = event["start"].get("dateTime", event["start"].get("date"))
-            schedule.append((start, event["summary"]))
+            end = event["end"].get("dateTime", event["end"].get("date"))
+            schedule.append((start, end, event["summary"]))
+        logger.info("Found %d events", len(schedule))
         return schedule
     except Exception as e:
-        logger.error(f"Failed to list calendar events: {e}")
+        logger.exception("Failed to list calendar events")
         return []
 
-def add_to_calendar(creds, _event, date, _start, timezone, duration=1, _end=None, frequency=None, byday=None, interval=None):
+def add_to_calendar(creds, _event, date, _start, timezone, duration=1, _end=None, frequency=None, byday=None, interval=None) -> int:
     """Add an event to Google Calendar"""
     try:
         # Get dependencies
@@ -75,11 +64,11 @@ def add_to_calendar(creds, _event, date, _start, timezone, duration=1, _end=None
         credential = Credentials(**creds)
         service = build("calendar", "v3", credentials=credential)
         
-        start = standardize_time(date, _start, timezone)
+        start = time_utils.standardize_time(date, _start, timezone)
         if type(duration) == type(None):
             duration = 1
         if _end:
-            end = standardize_time(date, _end, timezone)
+            end = time_utils.standardize_time(date, _end, timezone)
         else:
             end = datetime.isoformat(datetime.fromisoformat(start) + timedelta(hours=duration)) # Assume event is 1 hour long
             
@@ -117,9 +106,8 @@ def add_to_calendar(creds, _event, date, _start, timezone, duration=1, _end=None
                 }
             
         event_result = service.events().insert(calendarId="primary", body=event).execute()
-        logger.info(f"Event added to calendar: {event_result.get('htmlLink')}")
-        return {"success": True, "link": event_result.get('htmlLink')}
+        logger.info("Event added to calendar: %s", event_result.get('htmlLink'))
+        return 1
     except Exception as e:
-        logger.error(f"Failed to add to calendar: {e}")
-        return {"success": False, "error": str(e)}
-
+        logger.exception("Failed to add to calendar")
+        return 0

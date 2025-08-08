@@ -6,9 +6,12 @@ import pytz
 from openai import OpenAI
 from twilio.rest import Client
 import os
+from typing import List, Tuple
+
+from . import time_utils
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
 logger = logging.getLogger(__name__)
 
 _oclient = None
@@ -33,48 +36,37 @@ def get_twilio_client():
         _tclient = Client(twilio_sid, twilio_auth_token)
     return _tclient
 
-def standardize_time(date_str, time_str, user_timezone="US/Eastern"):
-    if not date_str: # Check if date is provided, if now, assume today
-        date_str = datetime.now(pytz.utc).strftime("%Y-%m-%d")
-
-    # Convert parsed strings to a datetime object
-    naive_dt = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-
-    # Set the correct timezone
-    user_tz = pytz.timezone(user_timezone) # Adds a time zone to datetime object
-    localized_dt = user_tz.localize(naive_dt)
-
-    # Convert to UTC
-    utc_dt = localized_dt.astimezone(pytz.utc).isoformat()
-
-    return utc_dt  # Return datetime in UTC
-
-def add_reminder(user_number, db, task, date, time, timezone, recurring=False, frequency=None):
+def add_reminder(user_number, db, task, date, time, timezone, recurring=False, frequency=None) -> int:
     reminder_ref = db.collection("Reminders").document()
     try:
         reminder_ref.set({
             "user_number": user_number,
             "task": task,
-            "time": standardize_time(date, time, timezone), 
+            "time": time_utils.standardize_time(date, time, timezone), 
             "recurring": recurring,
             "frequency": frequency,
             "status": "Pending"
         })
-        logger.info(f"Reminder stored from: {user_number}")
+        logger.info("Added reminder for %s: %s at %s", user_number, task, time)
+        return 1
     except Exception as e:
-        logger.warning(f"Failed to set reminder: {e}")
+        logger.exception("Failed to add reminder for %s", user_number)
+        return 0
 
 def delete_reminder(user_number, db, user_task, date=None, time=None): 
+    logger.info("Attempting to mark recurring reminder for %s matching task: %s as completed", user_number, user_task)
     to_delete_ref = db.collection("Reminders")
     to_delete = to_delete_ref.where(filter=FieldFilter("recurring", "==", True)).where(filter=FieldFilter("user_number", "==", user_number)).stream()
     for event in to_delete:
         event_dict = event.to_dict()
         task = event_dict.get("task")
         if fuzz.ratio(task, user_task) > 50 or task.lower() in user_task.lower() or user_task.lower() in task.lower():
+            logger.info("Setting %s to be completed", task)
             to_delete_ref.document(event.id).update({"status": "Completed"})
 
-def get_reminders(user_number, db, timezone='US/Eastern'):
-    
+def get_reminders(user_number, db, timezone='US/Eastern') -> List[Tuple[str, str]]:
+    if not timezone:
+        timezone = "US/Eastern"
     now = datetime.now(pytz.UTC).replace(second=0, microsecond=0).isoformat() # Don't change. All times in database is utc
     reminders = db.collection("Reminders").where(filter=FieldFilter("user_number", "==", user_number)).where(filter=FieldFilter("time", ">=", now)).where(filter=FieldFilter("status", "==", "Pending")).order_by("time").stream()
 
@@ -94,6 +86,7 @@ def get_reminders(user_number, db, timezone='US/Eastern'):
         dt = dt_obj.astimezone(pytz.timezone(timezone)).isoformat()
 
         schedule.append((task, dt))
+    logger.info("Found %d reminders associated with user: %s", len(schedule), user_number)
     return schedule
 
 def handle_reminders(event, db):
@@ -103,52 +96,45 @@ def handle_reminders(event, db):
     number = event_dict.get("user_number")
 
     # Get OpenAI client and create message
-    Oclient = get_openai_client()
-    message = Oclient.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "developer", 
-                "content": [
-                    {
-                        "type": "text",
-                        "text": "Create a friendly reminder for the task the user enters. Keep it brief and keep the name of the reminder relatively the same. Do not say tell the user to set a reminder. Simply, remind them." 
-                    }
-                ]
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"{task}"
-                    }
-                ]
-            }
-        ],
-        temperature=0.35
-    )
-    message_final = message.choices[0].message.content
-
+    try:
+        Oclient = get_openai_client()
+        message = Oclient.responses.create(
+            model="gpt-4o-mini",
+            instructions= "Create a friendly reminder for the task the user enters. Keep it brief and keep the name of the reminder relatively the same. Do not say tell the user to set a reminder. Simply, remind them.",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{task}"
+                        }
+                    ]
+                }
+            ],
+            temperature=0.35
+        )
+        message_final = message.output_text
+    except Exception as e:
+        logger.exception("Failed to generate reminder with OpenAI for user %s", number)
+        return
+    
     user_ref = db.collection("Users").document(f"{number}").get()
     if user_ref.exists:
-        # Append to threads
         user_dict = user_ref.to_dict()
-        Thread_id = user_dict.get("thread_ID")
-        Oclient = get_openai_client()
-        message = Oclient.beta.threads.messages.create(
-            thread_id=Thread_id,
-            role="assistant",
-            content=message_final
-        )
         # Add to twilio conversation
         twilio_id = user_dict.get("twilio_ID")
-        Tclient = get_twilio_client()
-        message = Tclient.conversations.v1.conversations(
-            twilio_id
-        ).messages.create(
-            body=message_final
-        )
+        try:
+            Tclient = get_twilio_client()
+            message = Tclient.conversations.v1.conversations(
+                twilio_id
+            ).messages.create(
+                body=message_final
+            )
+        except Exception as e:
+            logger.exception("Failed to send message to %s via Twilio", number)
+    else:
+        logger.warning("Failed to find Firestore document for user %s", number)
         
     # Set expired non-recurring reminder status to be completed 
     if event_dict.get("recurring") == False:

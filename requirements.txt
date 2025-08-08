@@ -29,6 +29,7 @@ multidict
 openai
 pydantic
 PyJWT
+python-dateutil
 python-dotenv
 pytz
 rapidfuzz
